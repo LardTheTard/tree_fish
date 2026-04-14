@@ -1,15 +1,17 @@
 from flask import Flask, request
 from flask_cors import CORS
-import chess
+from engine import makeResponse
 
 app = Flask(__name__)
 CORS(app)
 
 @app.route("/send_move", methods=['PUT'])
-def getText():
+async def response_to_move():
     req = request.get_json()
-    print(req)
-    return req, 200
+
+    response = await makeResponse(req)
+
+    return response, 200
 
 if __name__ == "__main__":
     app.run(debug=True)

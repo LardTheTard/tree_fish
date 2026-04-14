@@ -4,6 +4,8 @@ import { Chess } from "chess.js";
 import { Chessboard } from "react-chessboard";
 import sendMove from './move_to_flask.js'
 
+//https://react-chessboard.vercel.app/?path=/docs/how-to-use-basic-examples--docs
+
 function App() {
   const [game, setGame] = useState(new Chess());
   const [selectedSquare, setSelectedSquare] = useState(null);
@@ -15,7 +17,10 @@ function App() {
     try {
       gameCopy.move(move);
       setGame(gameCopy);
-
+      
+      // Add option to play against self maybe, but right now default to sending move to backend
+      // Assumes player wants to play against engine and expects response 
+      move['color'] = game.turn()
       sendMove(move)
 
       setSelectedSquare(null);
