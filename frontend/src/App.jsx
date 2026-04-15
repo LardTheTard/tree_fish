@@ -1,8 +1,9 @@
 import './App.css'
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Chess } from "chess.js";
 import { Chessboard } from "react-chessboard";
 import sendMove from './move_to_flask.js'
+import { resetBoard } from './move_to_flask.js';
 
 //https://react-chessboard.vercel.app/?path=/docs/how-to-use-basic-examples--docs
 
@@ -10,6 +11,10 @@ function App() {
   const [game, setGame] = useState(new Chess());
   const [selectedSquare, setSelectedSquare] = useState(null);
   const [gameStatus, setGameStatus] = useState(null);
+  
+  useEffect(() => {
+    resetBoard()
+  }, []);
 
   async function makeMove(move) {
     const gameCopy = new Chess(game.fen());
@@ -60,11 +65,9 @@ function App() {
   }
 
   function onSquareClick ({square}) {
-    console.log("square clicked")
     if (!selectedSquare) {
       const piece = game.get(square);
       if (piece && piece.color === game.turn()) {
-        console.log(square)
         setSelectedSquare(square);
       }
       return;

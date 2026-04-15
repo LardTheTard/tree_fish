@@ -16,6 +16,19 @@ export default async function sendMove(move_value) {
     }
 }
 
+export async function resetBoard() {
+    try {
+        const res = await fetch('/send_move/reset_board')
+        if (res.ok) {
+            console.log('Backend board reset!')
+        } else {
+            console.error("Something went wrong while resetting board.")
+        }
+    } catch (err) {
+        console.error(err)
+    }
+}
+
 // useEffect(() => {
 //     async function load() {
 //       try {

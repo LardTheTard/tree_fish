@@ -10,8 +10,13 @@ PROMOTION_MAP = {
     None: None
 }
 
-async def makeResponse(move_dict: dict) -> dict:
+def resetBoard():
+    global board
+    board = chess.Board()
+    return True
 
+def makeResponse(move_dict: dict) -> dict:
+    global board
     from_square = chess.parse_square(move_dict['from'])
     to_square = chess.parse_square(move_dict['to'])
     promotion = PROMOTION_MAP.get(move_dict['promotion'])
@@ -25,4 +30,7 @@ async def makeResponse(move_dict: dict) -> dict:
     print(board)
 
     #Have some processing here
-    return
+    return {
+        "status": 200,
+        "message": "move made"
+    }
