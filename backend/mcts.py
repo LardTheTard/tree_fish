@@ -1,238 +1,311 @@
 """
-Basic Monte Carlo Tree Search (MCTS) with PUCT exploration.
+mcts.py
+-------
+Monte Carlo Tree Search (PUCT variant, as in AlphaZero) using ChessNet for
+both prior policy estimation and leaf-node value estimation.
 
-PUCT score: Q(s,a) + c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
-
-  Q(s,a)  - mean value of action a from state s
-  P(s,a)  - prior probability (from a policy network, or uniform)
-  N(s)    - visit count of parent node
-  N(s,a)  - visit count of this edge
-  c_puct  - exploration constant
+Key differences from classical MCTS:
+  • No random rollouts — leaf value comes directly from the value head (v).
+  • Node selection uses PUCT (Polynomial Upper Confidence Trees):
+        U(s,a) = c_puct · P(s,a) · √N(s) / (1 + n(s,a))
+        Q(s,a) + U(s,a)
+  • Dirichlet noise added to the root priors to encourage exploration
+    (only during training / self-play).
 """
 
+from __future__ import annotations
+
 import math
-import random
-from collections import defaultdict
+import chess
+import numpy as np
+import torch
 
+from board_encoder import board_to_tensor, legal_moves_mask, action_to_move, move_to_action
+from network import ChessNet
 
 # ---------------------------------------------------------------------------
-# Node
+# MCTS Node
 # ---------------------------------------------------------------------------
 
-class Node:
-    def __init__(self, state, parent=None, prior=1.0):
-        self.state   = state        # opaque game state
-        self.parent  = parent
-        self.prior   = prior        # P(s,a) that led here
+class MCTSNode:
+    """
+    A single node in the search tree.
 
-        self.children: dict = {}    # action -> Node
-        self.visit_count  = 0
-        self.value_sum    = 0.0
+    Attributes:
+        board        : position at this node (copy, not view)
+        parent       : parent MCTSNode or None for root
+        move         : the chess.Move that led to this node (None for root)
+        children     : dict[chess.Move, MCTSNode]
+        prior        : P(s, a) from the network policy
+        visit_count  : N(s, a) — number of times this node was visited
+        value_sum    : W(s, a) — cumulative value from backpropagation
+    """
+
+    __slots__ = (
+        "board", "parent", "move", "children",
+        "prior", "visit_count", "value_sum", "_is_expanded",
+    )
+
+    def __init__(
+        self,
+        board: chess.Board,
+        parent: MCTSNode | None = None,
+        move: chess.Move | None = None,
+        prior: float = 0.0,
+    ):
+        self.board       = board
+        self.parent      = parent
+        self.move        = move
+        self.children:   dict[chess.Move, MCTSNode] = {}
+        self.prior       = prior
+        self.visit_count = 0
+        self.value_sum   = 0.0
+        self._is_expanded = False
 
     # ------------------------------------------------------------------
+
     @property
-    def q_value(self):
-        """Mean value from this node's perspective."""
+    def q_value(self) -> float:
+        """Mean action-value Q(s,a)."""
         if self.visit_count == 0:
             return 0.0
         return self.value_sum / self.visit_count
 
-    def puct_score(self, c_puct: float) -> float:
-        """PUCT score used by the parent to select this child."""
-        parent_visits = self.parent.visit_count if self.parent else 1
+    @property
+    def is_expanded(self) -> bool:
+        return self._is_expanded
+
+    def puct_score(self, c_puct: float, parent_visits: int) -> float:
+        """PUCT score used for child selection."""
         u = c_puct * self.prior * math.sqrt(parent_visits) / (1 + self.visit_count)
         return self.q_value + u
 
-    def is_leaf(self) -> bool:
-        return len(self.children) == 0
+    def is_terminal(self) -> bool:
+        return self.board.is_game_over()
 
-    def is_root(self) -> bool:
-        return self.parent is None
+    def terminal_value(self) -> float:
+        """
+        Returns +1 if the CURRENT player has won, -1 if they lost, 0 for draw.
+        (Value is always from the perspective of the player to move at this node.)
+        """
+        outcome = self.board.outcome()
+        if outcome is None:
+            return 0.0
+        if outcome.winner is None:
+            return 0.0  # draw
+        # winner is a chess.Color; current turn means the player who JUST moved
+        # loses (they wouldn't be in a terminal state if they had more moves).
+        won = outcome.winner == (not self.board.turn)  # last mover wins
+        return 1.0 if won else -1.0
+
+    def __repr__(self) -> str:
+        return (
+            f"MCTSNode(move={self.move}, "
+            f"N={self.visit_count}, Q={self.q_value:.3f}, P={self.prior:.3f})"
+        )
 
 
 # ---------------------------------------------------------------------------
-# MCTS
+# MCTS engine
 # ---------------------------------------------------------------------------
 
 class MCTS:
     """
-    Vanilla MCTS with PUCT selection.
+    AlphaZero-style MCTS.
 
-    Requires a `game` object that implements:
-        game.get_actions(state)          -> list of legal actions
-        game.apply_action(state, action) -> new_state
-        game.is_terminal(state)          -> bool
-        game.get_result(state)           -> float  (from current player's POV, +1 win / -1 loss)
-        game.get_prior(state, actions)   -> dict {action: prior_prob}  (uniform ok)
+    Args:
+        network    : trained (or initialised) ChessNet
+        device     : torch device for network inference
+        num_sims   : number of simulations (tree expansions) per move
+        c_puct     : exploration constant (AlphaZero default ≈ 1.0–5.0)
+        dirichlet_alpha  : α for Dirichlet noise at root (chess: 0.3)
+        dirichlet_weight : fraction of root prior replaced by noise (0.25)
+        temperature      : τ for visit-count sampling (1.0 = proportional,
+                           0 = deterministic argmax)
     """
 
-    def __init__(self, game, c_puct: float = 1.4, n_simulations: int = 200):
-        self.game         = game
-        self.c_puct       = c_puct
-        self.n_simulations = n_simulations
+    def __init__(
+        self,
+        network: ChessNet,
+        device: torch.device | None = None,
+        num_sims: int = 400,
+        c_puct: float = 2.5,
+        dirichlet_alpha: float = 0.3,
+        dirichlet_weight: float = 0.25,
+        temperature: float = 1.0,
+    ):
+        self.net              = network
+        self.device           = device or torch.device("cpu")
+        self.num_sims         = num_sims
+        self.c_puct           = c_puct
+        self.dirichlet_alpha  = dirichlet_alpha
+        self.dirichlet_weight = dirichlet_weight
+        self.temperature      = temperature
 
     # ------------------------------------------------------------------
-    # Public API
+    # Core MCTS steps
     # ------------------------------------------------------------------
 
-    def search(self, root_state) -> dict:
-        """Run simulations from root_state and return visit-count policy."""
-        root = Node(root_state)
-        self._expand(root)
-
-        for _ in range(self.n_simulations):
-            node  = self._select(root)
-            value = self._evaluate(node)
-            self._backpropagate(node, value)
-
-        # Policy: normalised visit counts
-        total = sum(c.visit_count for c in root.children.values())
-        policy = {
-            action: child.visit_count / total
-            for action, child in root.children.items()
-        }
-        return policy
-
-    def best_action(self, root_state):
-        policy = self.search(root_state)
-        return max(policy, key=policy.get)
-
-    # ------------------------------------------------------------------
-    # Four MCTS phases
-    # ------------------------------------------------------------------
-
-    def _select(self, node: Node) -> Node:
-        """Descend the tree, always picking the highest-PUCT child."""
-        while not node.is_leaf():
+    def _select(self, node: MCTSNode) -> MCTSNode:
+        """Traverse the tree using PUCT until we reach an unexpanded or terminal node."""
+        while node.is_expanded and not node.is_terminal():
             node = max(
                 node.children.values(),
-                key=lambda c: c.puct_score(self.c_puct)
+                key=lambda c: c.puct_score(self.c_puct, node.visit_count),
             )
         return node
 
-    def _expand(self, node: Node):
-        """Add all legal children to a leaf node."""
-        if self.game.is_terminal(node.state):
-            return
-        actions = self.game.get_actions(node.state)
-        priors  = self.game.get_prior(node.state, actions)
-        for action in actions:
-            child_state = self.game.apply_action(node.state, action)
-            node.children[action] = Node(
-                state  = child_state,
-                parent = node,
-                prior  = priors.get(action, 1.0 / len(actions)),
+    def _expand_and_evaluate(self, node: MCTSNode) -> float:
+        """
+        Expand the node using network priors and return the value estimate.
+        Returns the game-outcome value for terminal nodes.
+        """
+        if node.is_terminal():
+            return node.terminal_value()
+
+        board  = node.board
+        tensor = board_to_tensor(board, device=self.device)
+        mask   = legal_moves_mask(board, device=self.device)
+        probs, value = self.net.predict(tensor, mask)
+        probs_np = probs.cpu().numpy()
+
+        # Create children with network priors
+        for move in board.legal_moves:
+            action_idx = move_to_action(move)
+            prior      = float(probs_np[action_idx])
+            child_board = board.copy(stack=False)
+            child_board.push(move)
+            node.children[move] = MCTSNode(
+                board=child_board,
+                parent=node,
+                move=move,
+                prior=prior,
             )
 
-    def _evaluate(self, node: Node) -> float:
-        """
-        Expand then rollout (random playout) to get a value estimate.
-        In AlphaZero you'd replace the rollout with a value network call.
-        """
-        if self.game.is_terminal(node.state):
-            return self.game.get_result(node.state)
+        node._is_expanded = True
+        # Value is from the perspective of the player who just moved INTO this node.
+        # Since board.turn is now the NEXT player, flip the sign.
+        return -value
 
-        self._expand(node)          # expand before rollout
-        return self._rollout(node.state)
-
-    def _rollout(self, state) -> float:
-        """Random playout until terminal; return result."""
-        while not self.game.is_terminal(state):
-            actions = self.game.get_actions(state)
-            state   = self.game.apply_action(state, random.choice(actions))
-        return self.game.get_result(state)
-
-    def _backpropagate(self, node: Node, value: float):
+    def _backpropagate(self, node: MCTSNode, value: float) -> None:
         """
-        Walk back to root, flipping value sign at each ply
-        (assumes alternating two-player zero-sum game).
+        Walk back up to the root, flipping value sign at each ply
+        (value is always from the perspective of the current player).
         """
         while node is not None:
             node.visit_count += 1
             node.value_sum   += value
-            value = -value          # opponent's perspective
-            node  = node.parent
+            value             = -value
+            node              = node.parent
+
+    def _add_dirichlet_noise(self, root: MCTSNode) -> None:
+        """Inject Dirichlet noise into root children priors (used during training)."""
+        moves  = list(root.children.keys())
+        noise  = np.random.dirichlet([self.dirichlet_alpha] * len(moves))
+        w      = self.dirichlet_weight
+        for move, n in zip(moves, noise):
+            child = root.children[move]
+            child.prior = (1 - w) * child.prior + w * n
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def run(
+        self,
+        board: chess.Board,
+        add_noise: bool = False,
+    ) -> MCTSNode:
+        """
+        Run `num_sims` simulations from the given board position and return
+        the populated root node.
+
+        Args:
+            board     : current chess position
+            add_noise : add Dirichlet noise to root (True during self-play)
+        """
+        root = MCTSNode(board=board.copy(stack=False))
+
+        # Expand root immediately so we can add noise to its children
+        self._expand_and_evaluate(root)
+        if add_noise and root.children:
+            self._add_dirichlet_noise(root)
+
+        for _ in range(self.num_sims):
+            leaf  = self._select(root)
+            value = self._expand_and_evaluate(leaf)
+            self._backpropagate(leaf, value)
+
+        return root
+
+    def get_policy(self, root: MCTSNode) -> tuple[list[chess.Move], np.ndarray]:
+        """
+        Derive the improved policy π from visit counts.
+
+        Args:
+            root : root node after running simulations
+
+        Returns:
+            moves  : list of chess.Move
+            policy : normalised probability distribution over those moves
+                     (shaped by temperature τ)
+        """
+        moves   = list(root.children.keys())
+        counts  = np.array([root.children[m].visit_count for m in moves], dtype=np.float64)
+
+        if self.temperature == 0:
+            # Deterministic: one-hot on the most visited move
+            best = int(np.argmax(counts))
+            policy = np.zeros(len(moves), dtype=np.float64)
+            policy[best] = 1.0
+        else:
+            counts_t = counts ** (1.0 / self.temperature)
+            policy   = counts_t / counts_t.sum()
+
+        return moves, policy
+
+    def best_move(self, board: chess.Board, add_noise: bool = False) -> chess.Move:
+        """
+        Convenience wrapper: run MCTS and return the best move.
+
+        Args:
+            board     : current position
+            add_noise : whether to add Dirichlet noise (set True for self-play)
+        """
+        root         = self.run(board, add_noise=add_noise)
+        moves, probs = self.get_policy(root)
+        return moves[int(np.argmax(probs))]
+
+    def get_visit_counts(self, root: MCTSNode) -> dict[chess.Move, int]:
+        """Return raw visit counts keyed by move (useful for debugging)."""
+        return {m: c.visit_count for m, c in root.children.items()}
 
 
 # ---------------------------------------------------------------------------
-# Demo game: Tic-Tac-Toe
-# ---------------------------------------------------------------------------
-
-class TicTacToe:
-    """Minimal Tic-Tac-Toe for testing MCTS."""
-
-    def get_actions(self, state):
-        board, _ = state
-        return [i for i, v in enumerate(board) if v == 0]
-
-    def apply_action(self, state, action):
-        board, player = state
-        board = list(board)
-        board[action] = player
-        return (tuple(board), -player)
-
-    def is_terminal(self, state):
-        board, _ = state
-        return self._winner(board) != 0 or all(v != 0 for v in board)
-
-    def get_result(self, state):
-        """Return +1 if the player who just moved won, -1 if they lost, 0 draw."""
-        board, player = state
-        winner = self._winner(board)
-        # 'player' is the NEXT player to move, so the one who just moved is -player
-        if winner == -player:
-            return 1.0
-        if winner == player:
-            return -1.0
-        return 0.0
-
-    def get_prior(self, state, actions):
-        """Uniform prior — plug in a policy network here."""
-        p = 1.0 / len(actions)
-        return {a: p for a in actions}
-
-    def _winner(self, board):
-        lines = [
-            (0,1,2),(3,4,5),(6,7,8),   # rows
-            (0,3,6),(1,4,7),(2,5,8),   # cols
-            (0,4,8),(2,4,6),           # diagonals
-        ]
-        for a,b,c in lines:
-            if board[a] == board[b] == board[c] != 0:
-                return board[a]
-        return 0
-
-    def print_board(self, state):
-        board, player = state
-        symbols = {1: 'X', -1: 'O', 0: '.'}
-        for row in range(3):
-            print(' '.join(symbols[board[row*3+col]] for col in range(3)))
-        print(f"Next player: {'X' if player == 1 else 'O'}\n")
-
-
-# ---------------------------------------------------------------------------
-# Quick smoke test
+# Quick demo
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    game  = TicTacToe()
-    mcts  = MCTS(game, c_puct=1.4, n_simulations=400)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
-    state = (tuple([0]*9), 1)   # empty board, X moves first
+    from network import ChessNet, count_parameters
 
-    print("=== MCTS Tic-Tac-Toe self-play ===\n")
-    while not game.is_terminal(state):
-        game.print_board(state)
-        policy = mcts.search(state)
-        action = max(policy, key=policy.get)
-        print(f"Chosen action: {action}  (policy: { {a: f'{p:.2f}' for a,p in sorted(policy.items())} })\n")
-        state  = game.apply_action(state, action)
+    net  = ChessNet(num_res_blocks=10, channels=256).to(device)
+    mcts = MCTS(net, device=device, num_sims=50, temperature=1.0)
 
-    game.print_board(state)
-    winner = game._winner(state[0])
-    if winner == 1:
-        print("X wins!")
-    elif winner == -1:
-        print("O wins!")
-    else:
-        print("Draw!")
+    board = chess.Board()
+    print(f"Starting position:\n{board}\n")
+
+    root         = mcts.run(board, add_noise=True)
+    moves, probs = mcts.get_policy(root)
+
+    print("Top-5 moves by visit share:")
+    top_k = sorted(zip(moves, probs), key=lambda x: -x[1])[:5]
+    for m, p in top_k:
+        n = root.children[m].visit_count
+        q = root.children[m].q_value
+        print(f"  {board.san(m):8s}  visits={n:4d}  prob={p:.3f}  Q={q:+.4f}")
+
+    best = mcts.best_move(board)
+    print(f"\nBest move: {board.san(best)}")
