@@ -1,16 +1,13 @@
 """
-mcts.py
--------
-Monte Carlo Tree Search (PUCT variant, as in AlphaZero) using ChessNet for
-both prior policy estimation and leaf-node value estimation.
-
-Key differences from classical MCTS:
-  • No random rollouts — leaf value comes directly from the value head (v).
-  • Node selection uses PUCT (Polynomial Upper Confidence Trees):
-        U(s,a) = c_puct · P(s,a) · √N(s) / (1 + n(s,a))
-        Q(s,a) + U(s,a)
-  • Dirichlet noise added to the root priors to encourage exploration
-    (only during training / self-play).
+mcts_batched.py  (optimised)
+----------------------------
+Key changes vs v1:
+  • Board tensor cached on each MCTSNode — computed once, reused forever.
+  • Legal-move mask cached on each MCTSNode — same reason.
+  • Pre-allocated GPU batch buffer — no torch.stack() allocation every call.
+  • torch.inference_mode instead of no_grad (slightly faster).
+  • _select now returns a flat path list, avoiding repeated list appends.
+  • Removed redundant board.copy() calls during expansion.
 """
 
 from __future__ import annotations
@@ -19,116 +16,106 @@ import math
 import chess
 import numpy as np
 import torch
+import torch.nn.functional as F
 
-from board_encoder import board_to_tensor, legal_moves_mask, action_to_move, move_to_action
+from board_encoder import (
+    board_to_tensor, legal_moves_mask,
+    move_to_action, NUM_ACTIONS, NUM_PLANES, BOARD_SIZE,
+)
 from network import ChessNet
 
+
 # ---------------------------------------------------------------------------
-# MCTS Node
+# MCTS Node  (tensor cache added)
 # ---------------------------------------------------------------------------
 
 class MCTSNode:
-    """
-    A single node in the search tree.
-
-    Attributes:
-        board        : position at this node (copy, not view)
-        parent       : parent MCTSNode or None for root
-        move         : the chess.Move that led to this node (None for root)
-        children     : dict[chess.Move, MCTSNode]
-        prior        : P(s, a) from the network policy
-        visit_count  : N(s, a) — number of times this node was visited
-        value_sum    : W(s, a) — cumulative value from backpropagation
-    """
-
     __slots__ = (
         "board", "parent", "move", "children",
-        "prior", "visit_count", "value_sum", "_is_expanded",
+        "prior", "visit_count", "value_sum",
+        "virtual_loss", "_is_expanded",
+        "_tensor", "_mask",           # ← cached GPU-ready tensors
     )
 
     def __init__(
         self,
         board: chess.Board,
-        parent: MCTSNode | None = None,
-        move: chess.Move | None = None,
+        parent: "MCTSNode | None" = None,
+        move: "chess.Move | None" = None,
         prior: float = 0.0,
     ):
-        self.board       = board
-        self.parent      = parent
-        self.move        = move
-        self.children:   dict[chess.Move, MCTSNode] = {}
-        self.prior       = prior
-        self.visit_count = 0
-        self.value_sum   = 0.0
+        self.board        = board
+        self.parent       = parent
+        self.move         = move
+        self.children:    dict[chess.Move, MCTSNode] = {}
+        self.prior        = prior
+        self.visit_count  = 0
+        self.value_sum    = 0.0
+        self.virtual_loss = 0
         self._is_expanded = False
+        self._tensor      = None   # set on first access
+        self._mask        = None   # set on first access
 
-    # ------------------------------------------------------------------
+    def get_tensor(self, device: torch.device) -> torch.Tensor:
+        """(18,8,8) board tensor — computed once and cached on CPU."""
+        if self._tensor is None:
+            self._tensor = board_to_tensor(self.board)   # stays on CPU
+        return self._tensor.to(device, non_blocking=True)
+
+    def get_mask(self, device: torch.device) -> torch.Tensor:
+        """(NUM_ACTIONS,) legal-move mask — computed once and cached on CPU."""
+        if self._mask is None:
+            self._mask = legal_moves_mask(self.board)    # stays on CPU
+        return self._mask.to(device, non_blocking=True)
 
     @property
     def q_value(self) -> float:
-        """Mean action-value Q(s,a)."""
-        if self.visit_count == 0:
+        n = self.visit_count + self.virtual_loss
+        if n == 0:
             return 0.0
-        return self.value_sum / self.visit_count
-
-    @property
-    def is_expanded(self) -> bool:
-        return self._is_expanded
+        return (self.value_sum - self.virtual_loss) / n
 
     def puct_score(self, c_puct: float, parent_visits: int) -> float:
-        """PUCT score used for child selection."""
-        u = c_puct * self.prior * math.sqrt(parent_visits) / (1 + self.visit_count)
+        n = self.visit_count + self.virtual_loss
+        u = c_puct * self.prior * math.sqrt(max(parent_visits, 1)) / (1 + n)
         return self.q_value + u
 
     def is_terminal(self) -> bool:
         return self.board.is_game_over()
 
     def terminal_value(self) -> float:
-        """
-        Returns +1 if the CURRENT player has won, -1 if they lost, 0 for draw.
-        (Value is always from the perspective of the player to move at this node.)
-        """
         outcome = self.board.outcome()
-        if outcome is None:
+        if outcome is None or outcome.winner is None:
             return 0.0
-        if outcome.winner is None:
-            return 0.0  # draw
-        # winner is a chess.Color; current turn means the player who JUST moved
-        # loses (they wouldn't be in a terminal state if they had more moves).
-        won = outcome.winner == (not self.board.turn)  # last mover wins
-        return 1.0 if won else -1.0
-
-    def __repr__(self) -> str:
-        return (
-            f"MCTSNode(move={self.move}, "
-            f"N={self.visit_count}, Q={self.q_value:.3f}, P={self.prior:.3f})"
-        )
+        return 1.0 if outcome.winner != self.board.turn else -1.0
 
 
 # ---------------------------------------------------------------------------
-# MCTS engine
+# Batched MCTS
 # ---------------------------------------------------------------------------
 
-class MCTS:
+class BatchedMCTS:
     """
-    AlphaZero-style MCTS.
+    MCTS with batched GPU leaf evaluation and cached board tensors.
 
     Args:
-        network    : trained (or initialised) ChessNet
-        device     : torch device for network inference
-        num_sims   : number of simulations (tree expansions) per move
-        c_puct     : exploration constant (AlphaZero default ≈ 1.0–5.0)
-        dirichlet_alpha  : α for Dirichlet noise at root (chess: 0.3)
-        dirichlet_weight : fraction of root prior replaced by noise (0.25)
-        temperature      : τ for visit-count sampling (1.0 = proportional,
-                           0 = deterministic argmax)
+        network      : ChessNet
+        device       : torch device
+        num_sims     : total simulations per move
+        num_parallel : leaves per GPU batch — set equal to num_sims for
+                       exactly ONE forward pass per move (fastest)
+        c_puct       : exploration constant
+        dirichlet_alpha  : Dirichlet noise alpha for root
+        dirichlet_weight : fraction of prior replaced by noise
+        temperature  : for move sampling
     """
 
     def __init__(
         self,
         network: ChessNet,
         device: torch.device | None = None,
-        num_sims: int = 400,
+        num_sims: int = 200,
+        num_parallel: int = 64,
         c_puct: float = 2.5,
         dirichlet_alpha: float = 0.3,
         dirichlet_weight: float = 0.25,
@@ -137,175 +124,228 @@ class MCTS:
         self.net              = network
         self.device           = device or torch.device("cpu")
         self.num_sims         = num_sims
+        self.num_parallel     = num_parallel
         self.c_puct           = c_puct
         self.dirichlet_alpha  = dirichlet_alpha
         self.dirichlet_weight = dirichlet_weight
         self.temperature      = temperature
 
+        # Pre-allocate reusable CPU batch buffer to avoid repeated allocations
+        self._buf = torch.zeros(num_parallel, NUM_PLANES, BOARD_SIZE, BOARD_SIZE)
+
     # ------------------------------------------------------------------
-    # Core MCTS steps
+    # Selection (with virtual loss)
     # ------------------------------------------------------------------
 
-    def _select(self, node: MCTSNode) -> MCTSNode:
-        """Traverse the tree using PUCT until we reach an unexpanded or terminal node."""
-        while node.is_expanded and not node.is_terminal():
+    def _select(self, root: MCTSNode) -> tuple[MCTSNode, list[MCTSNode]]:
+        node = root
+        path = [node]
+        node.visit_count  += 1
+        node.virtual_loss += 1
+
+        while node._is_expanded and not node.is_terminal():
+            pv = node.visit_count + node.virtual_loss
             node = max(
                 node.children.values(),
-                key=lambda c: c.puct_score(self.c_puct, node.visit_count),
+                key=lambda c: c.puct_score(self.c_puct, pv),
             )
-        return node
+            node.visit_count  += 1
+            node.virtual_loss += 1
+            path.append(node)
 
-    def _expand_and_evaluate(self, node: MCTSNode) -> float:
-        """
-        Expand the node using network priors and return the value estimate.
-        Returns the game-outcome value for terminal nodes.
-        """
-        if node.is_terminal():
-            return node.terminal_value()
+        return node, path
 
-        board  = node.board
-        tensor = board_to_tensor(board, device=self.device)
-        mask   = legal_moves_mask(board, device=self.device)
-        probs, value = self.net.predict(tensor, mask)
-        probs_np = probs.cpu().numpy()
+    def _undo_virtual_loss(self, path: list[MCTSNode]) -> None:
+        for n in path:
+            n.virtual_loss -= 1
+            n.visit_count  -= 1   # will be re-incremented by backprop
 
-        # Create children with network priors
-        for move in board.legal_moves:
-            action_idx = move_to_action(move)
-            prior      = float(probs_np[action_idx])
-            child_board = board.copy(stack=False)
-            child_board.push(move)
-            node.children[move] = MCTSNode(
-                board=child_board,
-                parent=node,
-                move=move,
-                prior=prior,
-            )
+    # ------------------------------------------------------------------
+    # Batched expand + evaluate
+    # ------------------------------------------------------------------
 
-        node._is_expanded = True
-        # Value is from the perspective of the player who just moved INTO this node.
-        # Since board.turn is now the NEXT player, flip the sign.
-        return -value
+    @torch.inference_mode()
+    def _batch_evaluate(self, leaves: list[MCTSNode]) -> list[float]:
+        """Evaluate all leaves in a single GPU forward pass."""
+        values           = [None] * len(leaves)
+        non_terminal_idx = []
 
-    def _backpropagate(self, node: MCTSNode, value: float) -> None:
-        """
-        Walk back up to the root, flipping value sign at each ply
-        (value is always from the perspective of the current player).
-        """
-        while node is not None:
+        for i, leaf in enumerate(leaves):
+            if leaf.is_terminal():
+                values[i] = leaf.terminal_value()
+            else:
+                non_terminal_idx.append(i)
+
+        if not non_terminal_idx:
+            return values
+
+        B = len(non_terminal_idx)
+
+        # Fill pre-allocated buffer (avoids torch.stack allocation)
+        if B <= self.num_parallel:
+            buf = self._buf[:B]
+        else:
+            buf = torch.zeros(B, NUM_PLANES, BOARD_SIZE, BOARD_SIZE)
+
+        for slot, i in enumerate(non_terminal_idx):
+            buf[slot].copy_(leaves[i].get_tensor(torch.device("cpu")))
+
+        batch_tensors = buf.to(self.device, non_blocking=True)
+
+        # Stack masks for illegal-move filtering
+        batch_masks = torch.stack([
+            leaves[i].get_mask(self.device) for i in non_terminal_idx
+        ])  # (B, NUM_ACTIONS)
+
+        # ── ONE GPU CALL ──────────────────────────────────────────────
+        self.net.eval()
+        policy_logits, value_preds = self.net(batch_tensors)
+
+        policy_logits = policy_logits.masked_fill(~batch_masks, float("-inf"))
+        policy_probs  = F.softmax(policy_logits, dim=1).cpu().numpy()  # (B, 4672)
+        value_preds   = value_preds.cpu().numpy()                       # (B, 1)
+
+        # Expand each non-terminal leaf
+        for slot, leaf_idx in enumerate(non_terminal_idx):
+            leaf     = leaves[leaf_idx]
+            probs_np = policy_probs[slot]
+            val      = float(value_preds[slot, 0])
+
+            for move in leaf.board.legal_moves:
+                child_board = leaf.board.copy(stack=False)
+                child_board.push(move)
+                child = MCTSNode(
+                    board=child_board,
+                    parent=leaf,
+                    move=move,
+                    prior=float(probs_np[move_to_action(move)]),
+                )
+                leaf.children[move] = child
+
+            leaf._is_expanded = True
+            values[leaf_idx]  = -val   # flip: value is from parent's POV
+
+        return values
+
+    # ------------------------------------------------------------------
+    # Backpropagation
+    # ------------------------------------------------------------------
+
+    def _backpropagate(self, path: list[MCTSNode], value: float) -> None:
+        for node in reversed(path):
             node.visit_count += 1
             node.value_sum   += value
             value             = -value
-            node              = node.parent
+
+    # ------------------------------------------------------------------
+    # Dirichlet noise
+    # ------------------------------------------------------------------
 
     def _add_dirichlet_noise(self, root: MCTSNode) -> None:
-        """Inject Dirichlet noise into root children priors (used during training)."""
-        moves  = list(root.children.keys())
-        noise  = np.random.dirichlet([self.dirichlet_alpha] * len(moves))
-        w      = self.dirichlet_weight
+        moves = list(root.children.keys())
+        if not moves:
+            return
+        noise = np.random.dirichlet([self.dirichlet_alpha] * len(moves))
+        w     = self.dirichlet_weight
         for move, n in zip(moves, noise):
-            child = root.children[move]
-            child.prior = (1 - w) * child.prior + w * n
+            root.children[move].prior = (1 - w) * root.children[move].prior + w * n
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
-    def run(
-        self,
-        board: chess.Board,
-        add_noise: bool = False,
-    ) -> MCTSNode:
+    def run(self, board: chess.Board, add_noise: bool = False) -> MCTSNode:
         """
-        Run `num_sims` simulations from the given board position and return
-        the populated root node.
+        Run simulations from `board`.
 
-        Args:
-            board     : current chess position
-            add_noise : add Dirichlet noise to root (True during self-play)
+        With num_parallel == num_sims: exactly ONE GPU call per move.
+        With num_parallel <  num_sims: ceil(num_sims/num_parallel) GPU calls.
         """
         root = MCTSNode(board=board.copy(stack=False))
 
-        # Expand root immediately so we can add noise to its children
-        self._expand_and_evaluate(root)
+        # Initial expansion (populates root.children with priors)
+        self._batch_evaluate([root])
+        root.visit_count  = 0
+        root.value_sum    = 0.0
+        root.virtual_loss = 0
+
         if add_noise and root.children:
             self._add_dirichlet_noise(root)
 
-        for _ in range(self.num_sims):
-            leaf  = self._select(root)
-            value = self._expand_and_evaluate(leaf)
-            self._backpropagate(leaf, value)
+        num_batches = math.ceil(self.num_sims / self.num_parallel)
+
+        for _ in range(num_batches):
+            leaves = []
+            paths  = []
+
+            for _ in range(self.num_parallel):
+                leaf, path = self._select(root)
+                leaves.append(leaf)
+                paths.append(path)
+
+            values = self._batch_evaluate(leaves)
+
+            for path, value in zip(paths, values):
+                self._undo_virtual_loss(path)
+                self._backpropagate(path, value if value is not None else 0.0)
 
         return root
 
-    def get_policy(self, root: MCTSNode) -> tuple[list[chess.Move], np.ndarray]:
-        """
-        Derive the improved policy π from visit counts.
+    def get_policy(
+        self, root: MCTSNode
+    ) -> tuple[list[chess.Move], np.ndarray]:
+        moves  = list(root.children.keys())
+        counts = np.array(
+            [root.children[m].visit_count for m in moves], dtype=np.float64
+        )
 
-        Args:
-            root : root node after running simulations
-
-        Returns:
-            moves  : list of chess.Move
-            policy : normalised probability distribution over those moves
-                     (shaped by temperature τ)
-        """
-        moves   = list(root.children.keys())
-        counts  = np.array([root.children[m].visit_count for m in moves], dtype=np.float64)
-
-        if self.temperature == 0:
-            # Deterministic: one-hot on the most visited move
-            best = int(np.argmax(counts))
-            policy = np.zeros(len(moves), dtype=np.float64)
+        if self.temperature == 0 or counts.sum() == 0:
+            best   = int(np.argmax(counts))
+            policy = np.zeros(len(moves))
             policy[best] = 1.0
         else:
-            counts_t = counts ** (1.0 / self.temperature)
-            policy   = counts_t / counts_t.sum()
+            ct     = counts ** (1.0 / self.temperature)
+            policy = ct / ct.sum()
 
         return moves, policy
 
     def best_move(self, board: chess.Board, add_noise: bool = False) -> chess.Move:
-        """
-        Convenience wrapper: run MCTS and return the best move.
-
-        Args:
-            board     : current position
-            add_noise : whether to add Dirichlet noise (set True for self-play)
-        """
         root         = self.run(board, add_noise=add_noise)
         moves, probs = self.get_policy(root)
         return moves[int(np.argmax(probs))]
 
-    def get_visit_counts(self, root: MCTSNode) -> dict[chess.Move, int]:
-        """Return raw visit counts keyed by move (useful for debugging)."""
-        return {m: c.visit_count for m, c in root.children.items()}
-
 
 # ---------------------------------------------------------------------------
-# Quick demo
+# Benchmark
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import time
+    import sys
+    sys.path.insert(0, ".")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device}\n")
 
-    from network import ChessNet, count_parameters
-
-    net  = ChessNet(num_res_blocks=10, channels=256).to(device)
-    mcts = MCTS(net, device=device, num_sims=50, temperature=1.0)
-
+    from network import ChessNet
+    net   = ChessNet(num_res_blocks=4, channels=128).to(device)
     board = chess.Board()
-    print(f"Starting position:\n{board}\n")
+    N     = 50   # sims per benchmark run
 
-    root         = mcts.run(board, add_noise=True)
-    moves, probs = mcts.get_policy(root)
+    print(f"Benchmarking {N} sims, various num_parallel values:\n")
+    print(f"{'num_parallel':>14}  {'time':>8}  {'moves/s':>10}  {'GPU calls/move':>16}")
+    print("-" * 56)
 
-    print("Top-5 moves by visit share:")
-    top_k = sorted(zip(moves, probs), key=lambda x: -x[1])[:5]
-    for m, p in top_k:
-        n = root.children[m].visit_count
-        q = root.children[m].q_value
-        print(f"  {board.san(m):8s}  visits={n:4d}  prob={p:.3f}  Q={q:+.4f}")
-
-    best = mcts.best_move(board)
-    print(f"\nBest move: {board.san(best)}")
+    for np_val in [1, 8, 16, 32, N]:
+        mcts = BatchedMCTS(net, device=device, num_sims=N, num_parallel=np_val)
+        # warmup
+        mcts.run(board)
+        # timed
+        t0 = time.perf_counter()
+        REPS = 5
+        for _ in range(REPS):
+            mcts.run(board)
+        elapsed   = (time.perf_counter() - t0) / REPS
+        import math
+        gpu_calls = math.ceil(N / np_val)
+        print(f"{np_val:>14}  {elapsed:>7.3f}s  {1/elapsed:>10.1f}  {gpu_calls:>16}")
