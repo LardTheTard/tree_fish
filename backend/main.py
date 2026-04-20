@@ -7,9 +7,9 @@ import argparse
 from network import ChessNet
 from mcts import BatchedMCTS
 from play import *
-
+# C:\Users\ZhaoLo\chess\backend\venv\Scripts\activate.bat
 # python main.py checkpoint_iter0050.pt --color white --sims 50
-# python main.py checkpoint_iter0050.pt --color white --sims 200
+# python main.py checkpoint_iter0600.pt --color white --sims 200
 
 # ------------ ENGINE LOGIC --------------
 
