@@ -228,9 +228,10 @@ def main():
                 display_board(board, flip=not user_is_white)
                 continue
             
+            san = board.san(move)
             board.push(move)
-            move_history.append(board.san(move))
-            print(f"You played: {board.san(move)}")
+            move_history.append(san)
+            print(f"You played: {san}")
         
         else:
             # AI's turn

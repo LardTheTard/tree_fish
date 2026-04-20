@@ -26,7 +26,6 @@ function App() {
       // Add option to play against self maybe, but right now default to sending move to backend
       // Assumes player wants to play against engine and expects response 
       move['color'] = game.turn()
-      sendMove(move)
 
       setSelectedSquare(null);
     
@@ -40,6 +39,20 @@ function App() {
         setGameStatus("Game drawn.");
       } else {
         setGameStatus(null);
+        const response = await sendMove(move)
+        const gameAfterResponse = new Chess(gameCopy.fen());
+        console.log(response)
+
+        const aiMove = {
+          from: response.from,
+          to: response.to,
+        };
+        if (response.promotion) {
+          aiMove.promotion = response.promotion;
+        } 
+
+        gameAfterResponse.move(response);
+        setGame(gameAfterResponse);
       }
 
       return true;
@@ -100,7 +113,9 @@ function App() {
           </div>
         )}
 
-        <Chessboard options={chessboardOptions} />
+        <Chessboard 
+          options={chessboardOptions} 
+        />
       </div>
   );
 };

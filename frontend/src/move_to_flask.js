@@ -10,6 +10,7 @@ export default async function sendMove(move_value) {
         });
         if (res.ok) {
             console.log('okay dokay!')
+            return res.json()
         }
     } catch (err) {
         console.error(err)
