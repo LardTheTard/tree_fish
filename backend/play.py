@@ -20,7 +20,7 @@ import chess
 import torch
 
 from network import ChessNet
-from mcts_simple import BatchedMCTS
+from mcts_simple import MCTS
 
 
 def display_board(board: chess.Board, flip: bool = False):
@@ -70,7 +70,7 @@ def get_user_move(board: chess.Board) -> chess.Move | None:
 
 def ai_move(
     board: chess.Board,
-    mcts: BatchedMCTS,
+    mcts: MCTS,
     show_thinking: bool = True,
 ) -> chess.Move:
     """Generate AI move using MCTS."""
@@ -194,7 +194,7 @@ def main():
     print(f"Architecture: {num_res_blocks} res-blocks, {channels} channels\n")
 
     # Set up MCTS
-    mcts = BatchedMCTS(
+    mcts = MCTS(
         network=net,
         device=device,
         num_sims=args.sims,

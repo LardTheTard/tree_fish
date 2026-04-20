@@ -5,7 +5,7 @@ import chess
 import argparse
 
 from network import ChessNet
-from mcts_simple import BatchedMCTS
+from mcts_simple import MCTS
 from play import *
 # C:\Users\ZhaoLo\chess\backend\venv\Scripts\activate.bat
 # python main.py checkpoint_iter0050.pt --color white --sims 50
@@ -105,12 +105,12 @@ if __name__ == "__main__":
     print(f"Architecture: {num_res_blocks} res-blocks, {channels} channels\n")
 
     # Set up MCTS
-    mcts = BatchedMCTS(
+    mcts = MCTS(
         network=net,
         device=device,
         num_sims=args.sims,
-        num_parallel=args.sims,  # 1 GPU call per move
-        temperature=0.0,         # deterministic best move
+        # num_parallel=args.sims,
+        temperature=0.1,         # deterministic best move
     )
 
     app.run(debug=True)
