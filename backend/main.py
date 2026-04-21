@@ -5,11 +5,16 @@ import chess
 import argparse
 
 from network import ChessNet
-from mcts_simple import MCTS
+from mcts import MCTS
 from play import *
 # C:\Users\ZhaoLo\chess\backend\venv\Scripts\activate.bat
-# python main.py checkpoint_iter0050.pt --color white --sims 50
-# python main.py checkpoint_iter0600.pt --color white --sims 200
+# python main.py dataset_trained_40iter.pt --color white --sims 500
+# python main.py dataset_trained_140iter.pt --color white --sims 500
+# python main.py dataset_trained_160iter.pt --color white --sims 500
+# python main.py fast_loss_decrease_100iter.pt --color white --sims 500
+
+# NN can't find mate in one, probably no mate flag or all mates look the same to it.
+# Fix this by making a mate flag???
 
 # ------------ ENGINE LOGIC --------------
 
@@ -109,8 +114,7 @@ if __name__ == "__main__":
         network=net,
         device=device,
         num_sims=args.sims,
-        # num_parallel=args.sims,
-        temperature=0.1,         # deterministic best move
+        temperature=0.0,         # deterministic best move
     )
 
     app.run(debug=True)

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import random
 import collections
+import msgpack
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -26,7 +27,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from board_encoder import board_to_tensor, move_to_action, NUM_ACTIONS
 from network import ChessNet, AlphaZeroLoss, count_parameters
-from mcts_simple import MCTS
+from mcts import MCTS
 
 import matplotlib.pyplot as plt
 
@@ -37,33 +38,31 @@ import matplotlib.pyplot as plt
 @dataclass
 class Config:
     # Network
-    num_res_blocks: int = 4
-    channels: int = 128
+    num_res_blocks: int = 8
+    channels: int = 256
     
     # MCTS
     num_sims: int = 50
 
     # Training
-    buffer_size: int = 10000
+    buffer_size: int = 20000
     batch_size: int = 128
     train_steps: int = 100
-    lr: float = 1e-3
-    num_iterations: int = 50
-    checkpoint_every: int = 5
+    lr: float = 3e-4
+    num_iterations: int = 100
+    checkpoint_every: int = 10
 
     # Self-play
     games_per_iter: int = 10
     max_game_moves: int = 200
     
     # Dataset
-    max_samples = 1e4
-    path: str = r'C:\Users\ZhaoLo\chess\backend\data\train-00000-of-01024.msgpack'
+    max_samples: int = 10_000
+    path: str = r'C:\Users\login\tree_fish\tree_fish\backend\data'
     
     # Misc
     device: str = "cuda"
     seed: int = 42
-
-
 
 cfg = Config()
 
@@ -118,7 +117,7 @@ class SampleDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Self-play
+# Self-play trianing utils
 # ---------------------------------------------------------------------------
 
 def play_game(net: ChessNet, mcts: MCTS, device: torch.device) -> list[GameSample]:
@@ -171,7 +170,7 @@ def play_game(net: ChessNet, mcts: MCTS, device: torch.device) -> list[GameSampl
     return samples
 
 # ---------------------------------------------------------------------------
-# Dataset loading
+# Dataset training utils
 # ---------------------------------------------------------------------------
 
 def chessbench_record_to_sample(
@@ -196,7 +195,7 @@ def chessbench_record_to_sample(
     board = chess.Board(record["fen"])
     
     # --- 1. Encode board ---
-    board_tensor = board_to_tensor(board, device=device).cpu()
+    board_tensor = board_to_tensor(board, device=torch.device("cpu"))
     
     # --- 2. Build policy vector ---
     policy_vec = torch.zeros(NUM_ACTIONS, dtype=torch.float32)
@@ -236,33 +235,6 @@ def chessbench_record_to_sample(
     outcome = torch.sum(probs * scores).item()
     
     return GameSample(board_tensor, policy_vec, outcome)
-
-def load_chessbench_samples(
-    start_idx: int,
-    filepath: str,
-    max_samples: int,
-    device: torch.device,
-) -> list[GameSample]:
-    import msgpack
-    
-    samples = []
-    
-    with open(filepath, "rb") as f:
-        unpacker = msgpack.Unpacker(f, raw=False)
-        
-        for i, record in enumerate(unpacker):
-            if i < start_idx:
-                continue
-
-            sample = chessbench_record_to_sample(record, device)
-            
-            if sample is not None:
-                samples.append(sample)
-            
-            if len(samples) >= max_samples:
-                break
-    
-    return samples
 
 # ---------------------------------------------------------------------------
 # Training
@@ -385,6 +357,10 @@ def train_self_play():
     print("Training complete!")
 
 def train_on_dataset():
+    import glob
+    from pathlib import Path
+    import time
+    
     loss_history = []
     policy_history = []
     value_history = []
@@ -394,7 +370,7 @@ def train_on_dataset():
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
     
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     
     # Build network
@@ -409,20 +385,77 @@ def train_on_dataset():
     # Replay buffer
     buffer = ReplayBuffer(cfg.buffer_size)
     
-    print(f"Config: {cfg.max_samples} max samples per iteration\n")
+    # Find all msgpack files in the directory
+    data_dir = Path(cfg.path)
+    msgpack_files = sorted(glob.glob(str(data_dir / "*.msgpack")))
+    print(f"Found {len(msgpack_files)} msgpack files in {data_dir}")
+    print(f"Config: {int(cfg.max_samples)} samples per iteration\n")
+    
+    # Initialize streaming state
+    current_file_idx = 0
+    current_unpacker = None
+    current_file_handle = None
+    
+    def get_next_samples(n: int) -> list[GameSample]:
+        """Get next n samples from the dataset, spanning files if needed."""
+        nonlocal current_file_idx, current_unpacker, current_file_handle
+        
+        samples = []
+        
+        while len(samples) < n and current_file_idx < len(msgpack_files):
+            # Open new file if needed
+            if current_unpacker is None:
+                if current_file_handle is not None:
+                    current_file_handle.close()
+                
+                filepath = msgpack_files[current_file_idx]
+                print(f"  Opening file {current_file_idx + 1}/{len(msgpack_files)}: {Path(filepath).name}")
+                current_file_handle = open(filepath, "rb")
+                current_unpacker = msgpack.Unpacker(current_file_handle, raw=False)
+            
+            # Read from current file
+            try:
+                for record in current_unpacker:
+                    sample = chessbench_record_to_sample(record, device)
+                    if sample is not None:
+                        samples.append(sample)
+                    
+                    if len(samples) >= n:
+                        break
+                else:
+                    # File exhausted, move to next
+                    current_file_idx += 1
+                    current_unpacker = None
+                    if current_file_handle is not None:
+                        current_file_handle.close()
+                        current_file_handle = None
+            except StopIteration:
+                # File exhausted
+                current_file_idx += 1
+                current_unpacker = None
+                if current_file_handle is not None:
+                    current_file_handle.close()
+                    current_file_handle = None
+        
+        return samples
     
     # Training loop
     for iteration in range(1, cfg.num_iterations + 1):
         print(f"{'='*60}")
         print(f"Iteration {iteration}/{cfg.num_iterations}")
         print(f"{'='*60}")
-
-        start_idx = iteration * cfg.max_samples
         
-        new_samples = load_chessbench_samples(start_idx, cfg.path, cfg.max_samples, device)
+        # Load next chunk of samples
+        load_start = time.time()
+        new_samples = get_next_samples(int(cfg.max_samples))
+        load_time = time.time() - load_start
+        
+        if len(new_samples) == 0:
+            print("  No more samples available in dataset!")
+            break
+        
         buffer.add(new_samples)
-
-        print(f"  Added {len(new_samples)} positions, buffer size = {len(buffer)}\n")
+        print(f"  Loaded {len(new_samples)} positions in {load_time:.2f}s, buffer size = {len(buffer)}\n")
         
         # Training phase
         if len(buffer) < cfg.batch_size:
@@ -434,17 +467,25 @@ def train_on_dataset():
         dataset = SampleDataset(batch_samples)
         loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True)
         
+        # Train with timing
+        train_start = time.time()
         metrics = train(net, optimizer, criterion, loader, device)
+        train_time = time.time() - train_start
         scheduler.step()
 
         loss_history.append(metrics["loss"])
         policy_history.append(metrics["policy"])
         value_history.append(metrics["value"])
         
+        # Calculate batch timing
+        n_batches = len(batch_samples) // cfg.batch_size
+        ms_per_batch = (train_time / n_batches) * 1000 if n_batches > 0 else 0
+        
         print(f"  loss={metrics['loss']:.4f}  "
               f"policy={metrics['policy']:.4f}  "
               f"value={metrics['value']:.4f}  "
-              f"lr={scheduler.get_last_lr()[0]:.2e}\n")
+              f"lr={scheduler.get_last_lr()[0]:.2e}")
+        print(f"  Train time: {train_time:.2f}s ({n_batches} batches, {ms_per_batch:.1f}ms/batch)\n")
         
         # Checkpoint
         if iteration % cfg.checkpoint_every == 0:
@@ -457,6 +498,10 @@ def train_on_dataset():
                 "optimizer": optimizer.state_dict(),
             }, path)
             print(f"  Checkpoint saved: {path}\n")
+    
+    # Cleanup
+    if current_file_handle is not None:
+        current_file_handle.close()
     
     plot_loss(loss_history, policy_history, value_history)
 
