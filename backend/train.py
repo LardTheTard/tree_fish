@@ -175,7 +175,7 @@ def play_game(net: ChessNet, mcts: MCTS, device: torch.device) -> list[GameSampl
 
 def chessbench_record_to_sample(
     record: dict,
-    tau: float = 0.1,
+    tau: float = 0.05,
 ) -> GameSample:
     """
     Convert a ChessBench record into a GameSample.

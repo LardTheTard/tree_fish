@@ -52,8 +52,11 @@ class MCTSNode:
     def puct_score(self, c_puct: float, parent_visits: int) -> float:
         """PUCT formula: Q(s,a) + U(s,a)"""
         total_visits = self.visit_count + self.virtual_loss
+
+        # (heuristic)
         if self.q_value > 0.8:
             c_puct /= 4
+            
         u = c_puct * self.prior * math.sqrt(parent_visits) / (1 + total_visits)
         return self.q_value + u
 
@@ -79,7 +82,7 @@ class MCTS:
         device: torch.device,
         num_sims: int = 800,
         batch_size: int = 16,
-        c_puct: float = 2.5,
+        c_puct: float = 2,
         virtual_loss_weight: float = 1.0,
         dirichlet_alpha: float = 0.3,
         temperature: float = 1.0,
@@ -220,7 +223,7 @@ class MCTS:
                 child_board.push(move)
                 prior = float(node_probs[move_to_action(move)])
 
-                # -------- Slight bias towards checks and captures in order to promote attacking behaviours when winning/explore them more
+                # -------- (heuristic) Slight bias towards checks and captures in order to promote attacking behaviours when winning/explore them more
                 if node.board.is_capture(move) or child_board.is_check():
                     prior *= 1.2
 
