@@ -38,12 +38,12 @@ import matplotlib.pyplot as plt
 @dataclass
 class Config:
     # Network
-    num_res_blocks: int = 8
+    num_res_blocks: int = 10
     channels: int = 256
 
     # Training
     buffer_size: int = 100_000
-    batch_size: int = 100
+    batch_size: int = 128
     train_steps: int = 100
     lr: float = 1e-3
     num_iterations: int = 500
@@ -55,9 +55,7 @@ class Config:
     num_sims: int = 50 # MCTS
     
     # Dataset
-    active_files: int = 4          # how many shard files to mix at once
-    samples_per_file: int = 2500   # active_files * samples_per_file ≈ max_samples
-    max_samples: int = active_files * samples_per_file
+    max_samples: int = 10_000
     path: str = r'C:\Users\login\tree_fish\tree_fish\backend\data'
     
     # Misc
@@ -175,6 +173,7 @@ def play_game(net: ChessNet, mcts: MCTS, device: torch.device) -> list[GameSampl
 
 def chessbench_record_to_sample(
     record: dict,
+    device: torch.device,
     tau: float = 0.1,
 ) -> GameSample:
     """
@@ -401,89 +400,52 @@ def train_on_dataset_from_loaded_checkpoint(path: str):
     print(f"Found {len(msgpack_files)} msgpack files in {data_dir}")
     print(f"Config: {int(cfg.max_samples)} samples per iteration\n")
     
-       # Shuffle file order once at the start
-    random.shuffle(msgpack_files)
-
-    # State for each active file stream
-    stream_states = []
-    next_file_idx = 0
-
-    def open_new_stream():
-        nonlocal next_file_idx
-
-        # wrap around and reshuffle after a full pass
-        if next_file_idx >= len(msgpack_files):
-            next_file_idx = 0
-            random.shuffle(msgpack_files)
-
-        filepath = msgpack_files[next_file_idx]
-        next_file_idx += 1
-
-        fh = open(filepath, "rb")
-        unpacker = msgpack.Unpacker(fh, raw=False)
-
-        return {
-            "filepath": filepath,
-            "handle": fh,
-            "unpacker": unpacker,
-        }
-
-    # initialize active streams
-    num_streams = min(cfg.active_files, len(msgpack_files))
-    for _ in range(num_streams):
-        stream_states.append(open_new_stream())
-
-    def refill_stream(i: int):
-        old = stream_states[i]
-        old["handle"].close()
-        stream_states[i] = open_new_stream()
-
-    def get_mixed_samples(total_n: int) -> list[GameSample]:
+    # Initialize streaming state
+    current_file_idx = 0
+    current_unpacker = None
+    current_file_handle = None
+    
+    def get_next_samples(n: int) -> list[GameSample]:
+        """Get next n samples from the dataset, spanning files if needed."""
+        nonlocal current_file_idx, current_unpacker, current_file_handle
+        
         samples = []
-
-        if len(stream_states) == 0:
-            return samples
-
-        per_stream = max(1, total_n // len(stream_states))
-
-        # read roughly evenly from each active stream
-        for i in range(len(stream_states)):
-            taken = 0
-
-            while taken < per_stream and len(samples) < total_n:
-                stream = stream_states[i]
-
-                try:
-                    record = next(stream["unpacker"])
-                except StopIteration:
-                    refill_stream(i)
-                    continue
-
-                sample = chessbench_record_to_sample(record)
-                if sample is None:
-                    continue
-
-                samples.append(sample)
-                taken += 1
-
-        # if integer division left us short, top up from random active streams
-        while len(samples) < total_n and len(stream_states) > 0:
-            i = random.randrange(len(stream_states))
-            stream = stream_states[i]
-
+        
+        while len(samples) < n and current_file_idx < len(msgpack_files):
+            # Open new file if needed
+            if current_unpacker is None:
+                if current_file_handle is not None:
+                    current_file_handle.close()
+                
+                filepath = msgpack_files[current_file_idx]
+                print(f"  Opening file {current_file_idx + 1}/{len(msgpack_files)}: {Path(filepath).name}")
+                current_file_handle = open(filepath, "rb")
+                current_unpacker = msgpack.Unpacker(current_file_handle, raw=False)
+            
+            # Read from current file
             try:
-                record = next(stream["unpacker"])
+                for record in current_unpacker:
+                    sample = chessbench_record_to_sample(record, device)
+                    if sample is not None:
+                        samples.append(sample)
+                    
+                    if len(samples) >= n:
+                        break
+                else:
+                    # File exhausted, move to next
+                    current_file_idx += 1
+                    current_unpacker = None
+                    if current_file_handle is not None:
+                        current_file_handle.close()
+                        current_file_handle = None
             except StopIteration:
-                refill_stream(i)
-                continue
-
-            sample = chessbench_record_to_sample(record)
-            if sample is None:
-                continue
-
-            samples.append(sample)
-
-        random.shuffle(samples)
+                # File exhausted
+                current_file_idx += 1
+                current_unpacker = None
+                if current_file_handle is not None:
+                    current_file_handle.close()
+                    current_file_handle = None
+        
         return samples
     
     # Training loop
@@ -494,7 +456,7 @@ def train_on_dataset_from_loaded_checkpoint(path: str):
         
         # Load next chunk of samples
         load_start = time.time()
-        new_samples = get_mixed_samples(int(cfg.max_samples))
+        new_samples = get_next_samples(int(cfg.max_samples))
         load_time = time.time() - load_start
         
         if len(new_samples) == 0:
@@ -547,8 +509,8 @@ def train_on_dataset_from_loaded_checkpoint(path: str):
             print(f"  Checkpoint saved: {path}\n")
     
     # Cleanup
-    for stream in stream_states:
-        stream["handle"].close()
+    if current_file_handle is not None:
+        current_file_handle.close()
     
     plot_loss(loss_history, policy_history, value_history)
 
@@ -589,89 +551,52 @@ def train_on_dataset():
     print(f"Found {len(msgpack_files)} msgpack files in {data_dir}")
     print(f"Config: {int(cfg.max_samples)} samples per iteration\n")
     
-       # Shuffle file order once at the start
-    random.shuffle(msgpack_files)
-
-    # State for each active file stream
-    stream_states = []
-    next_file_idx = 0
-
-    def open_new_stream():
-        nonlocal next_file_idx
-
-        # wrap around and reshuffle after a full pass
-        if next_file_idx >= len(msgpack_files):
-            next_file_idx = 0
-            random.shuffle(msgpack_files)
-
-        filepath = msgpack_files[next_file_idx]
-        next_file_idx += 1
-
-        fh = open(filepath, "rb")
-        unpacker = msgpack.Unpacker(fh, raw=False)
-
-        return {
-            "filepath": filepath,
-            "handle": fh,
-            "unpacker": unpacker,
-        }
-
-    # initialize active streams
-    num_streams = min(cfg.active_files, len(msgpack_files))
-    for _ in range(num_streams):
-        stream_states.append(open_new_stream())
-
-    def refill_stream(i: int):
-        old = stream_states[i]
-        old["handle"].close()
-        stream_states[i] = open_new_stream()
-
-    def get_mixed_samples(total_n: int) -> list[GameSample]:
+    # Initialize streaming state
+    current_file_idx = 0
+    current_unpacker = None
+    current_file_handle = None
+    
+    def get_next_samples(n: int) -> list[GameSample]:
+        """Get next n samples from the dataset, spanning files if needed."""
+        nonlocal current_file_idx, current_unpacker, current_file_handle
+        
         samples = []
-
-        if len(stream_states) == 0:
-            return samples
-
-        per_stream = max(1, total_n // len(stream_states))
-
-        # read roughly evenly from each active stream
-        for i in range(len(stream_states)):
-            taken = 0
-
-            while taken < per_stream and len(samples) < total_n:
-                stream = stream_states[i]
-
-                try:
-                    record = next(stream["unpacker"])
-                except StopIteration:
-                    refill_stream(i)
-                    continue
-
-                sample = chessbench_record_to_sample(record)
-                if sample is None:
-                    continue
-
-                samples.append(sample)
-                taken += 1
-
-        # if integer division left us short, top up from random active streams
-        while len(samples) < total_n and len(stream_states) > 0:
-            i = random.randrange(len(stream_states))
-            stream = stream_states[i]
-
+        
+        while len(samples) < n and current_file_idx < len(msgpack_files):
+            # Open new file if needed
+            if current_unpacker is None:
+                if current_file_handle is not None:
+                    current_file_handle.close()
+                
+                filepath = msgpack_files[current_file_idx]
+                print(f"  Opening file {current_file_idx + 1}/{len(msgpack_files)}: {Path(filepath).name}")
+                current_file_handle = open(filepath, "rb")
+                current_unpacker = msgpack.Unpacker(current_file_handle, raw=False)
+            
+            # Read from current file
             try:
-                record = next(stream["unpacker"])
+                for record in current_unpacker:
+                    sample = chessbench_record_to_sample(record, device)
+                    if sample is not None:
+                        samples.append(sample)
+                    
+                    if len(samples) >= n:
+                        break
+                else:
+                    # File exhausted, move to next
+                    current_file_idx += 1
+                    current_unpacker = None
+                    if current_file_handle is not None:
+                        current_file_handle.close()
+                        current_file_handle = None
             except StopIteration:
-                refill_stream(i)
-                continue
-
-            sample = chessbench_record_to_sample(record)
-            if sample is None:
-                continue
-
-            samples.append(sample)
-
-        random.shuffle(samples)
+                # File exhausted
+                current_file_idx += 1
+                current_unpacker = None
+                if current_file_handle is not None:
+                    current_file_handle.close()
+                    current_file_handle = None
+        
         return samples
     
     # Training loop
@@ -682,7 +607,7 @@ def train_on_dataset():
         
         # Load next chunk of samples
         load_start = time.time()
-        new_samples = get_mixed_samples(int(cfg.max_samples))
+        new_samples = get_next_samples(int(cfg.max_samples))
         load_time = time.time() - load_start
         
         if len(new_samples) == 0:
@@ -735,8 +660,8 @@ def train_on_dataset():
             print(f"  Checkpoint saved: {path}\n")
     
     # Cleanup
-    for stream in stream_states:
-        stream["handle"].close()
+    if current_file_handle is not None:
+        current_file_handle.close()
     
     plot_loss(loss_history, policy_history, value_history)
 

@@ -7,9 +7,10 @@ from mcts import MCTS
 
 from tqdm import tqdm
 
-CHECKPOINT1 = r'C:\Users\login\tree_fish\tree_fish\backend\dataset_trained_160iter.pt'
+CHECKPOINT1 = r'C:\Users\login\tree_fish\tree_fish\backend\dataset_trained_140iter.pt'
 CHECKPOINT2 = r'C:\Users\login\tree_fish\tree_fish\backend\dataset_trained_140iter.pt'
-NUM_SIMS = 50
+NUM_SIMS = 500
+NUM_SIMS_2 = 0
 SHOW_THINKING = False
 NUM_GAMES = 10
 
@@ -149,7 +150,7 @@ def main():
     mcts_2 = MCTS(
         network=net_2,
         device=device,
-        num_sims=NUM_SIMS,
+        num_sims=NUM_SIMS_2,
         temperature=0.0,         # deterministic best move
     )
     

@@ -18,6 +18,9 @@ for filename in os.listdir(directory):
     for idx, record in enumerate(load_positions(filepath)):
         fen = record['fen']
         moves = record['moves']
+
+        if idx == 500_000:
+            print(moves)
         
         num = max(num ,idx)
     print(num)

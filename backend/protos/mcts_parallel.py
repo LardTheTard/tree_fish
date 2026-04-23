@@ -39,6 +39,7 @@ class MCTSNode:
         self.visit_count = 0
         self.value_sum = 0.0
         self.virtual_loss = 0  # For parallel simulations
+        self.distance = 2**32
         self.is_expanded = False
     
     @property
@@ -56,7 +57,7 @@ class MCTSNode:
         return self.q_value + u
 
 
-class MCTS:
+class ParallelMCTS:
     """
     Batched MCTS with virtual loss for efficient parallel search.
     
@@ -94,91 +95,107 @@ class MCTS:
     def run(self, board: chess.Board, add_noise: bool = False) -> MCTSNode:
         """Run num_sims simulations with batched evaluation."""
         root = MCTSNode(board=board.copy(stack=False))
-
+        root.distance = 0
+        
         # Expand root first
         self._expand_batch([root])
-
+        
+        # Add Dirichlet noise for exploration during training
         if add_noise and root.children:
             self._add_noise(root)
-
+        
+        # Run simulations in batches
         num_batches = (self.num_sims + self.batch_size - 1) // self.batch_size
-
+        
         for batch_idx in range(num_batches):
             batch_leaves = []
             batch_paths = []
-            batch_depths = []
-
+            
+            # Collect a batch of leaves
             sims_this_batch = min(self.batch_size, self.num_sims - batch_idx * self.batch_size)
-
+            
             for _ in range(sims_this_batch):
                 node = root
                 path = [node]
-
+                
+                # Selection: traverse tree using PUCT
                 while node.is_expanded and not node.board.is_game_over():
                     node = max(
                         node.children.values(),
                         key=lambda c: c.puct_score(self.c_puct, node.visit_count)
                     )
+                    node.distance = min(path[-1].distance + 1, node.distance)
                     path.append(node)
-
+                
+                # Apply virtual loss to prevent other simulations from selecting this path
                 for n in path:
                     n.virtual_loss += self.virtual_loss_weight
-
+                
                 batch_leaves.append(node)
                 batch_paths.append(path)
-                batch_depths.append(len(path) - 1)
-
-            values = self._evaluate_batch(batch_leaves, batch_depths)
-
+            
+            # Evaluate all leaves in batch
+            values = self._evaluate_batch(batch_leaves)
+            
+            # Backpropagate and remove virtual loss
             for path, value in zip(batch_paths, values):
+                # Remove virtual loss
                 for n in path:
                     n.virtual_loss -= self.virtual_loss_weight
-
+                
+                # Backprop the actual value
                 self._backprop(path, value)
-
+        
         return root
     
     @torch.no_grad()
-    def _evaluate_batch(self, nodes: list[MCTSNode], depths: list[int]) -> list[float]:
+    def _evaluate_batch(self, nodes: list[MCTSNode]) -> list[float]:
         """Evaluate a batch of leaf nodes."""
         if not nodes:
             return []
-
+        
         values = []
         non_terminal_nodes = []
         non_terminal_indices = []
-
-        for i, (node, depth) in enumerate(zip(nodes, depths)):
+        
+        # Separate terminal and non-terminal nodes
+        for i, node in enumerate(nodes):
             if node.board.is_game_over():
-                values.append(self._terminal_value(node, depth))
+                values.append(self._terminal_value(node))
             else:
                 non_terminal_nodes.append(node)
                 non_terminal_indices.append(i)
-                values.append(0.0)
-
+                values.append(0.0)  # Placeholder
+        
+        # Batch evaluate non-terminal nodes
         if non_terminal_nodes:
+            # Expand all non-terminal nodes first
             self._expand_batch(non_terminal_nodes)
-
+            
+            # Create batched tensors
             batch_tensors = []
             batch_masks = []
-
+            
             for node in non_terminal_nodes:
                 tensor = board_to_tensor(node.board, device=self.device)
                 mask = legal_moves_mask(node.board, device=self.device)
                 batch_tensors.append(tensor)
                 batch_masks.append(mask)
-
-            batch_tensors = torch.stack(batch_tensors, dim=0)
-            batch_masks = torch.stack(batch_masks, dim=0)
-
+            
+            batch_tensors = torch.stack(batch_tensors, dim=0)  # (N, 18, 8, 8)
+            batch_masks = torch.stack(batch_masks, dim=0)      # (N, 4672)
+            
+            # Single forward pass for all nodes
             self.net.eval()
             policy_logits, batch_values = self.net(batch_tensors)
-
+            
+            # Extract values and flip sign (value is from opponent's perspective after move)
             network_values = -batch_values[:, 0].cpu().numpy()
-
+            
+            # Place network values back into the values list
             for idx, val in zip(non_terminal_indices, network_values):
                 values[idx] = float(val)
-
+        
         return values
     
     @torch.no_grad()
@@ -225,22 +242,12 @@ class MCTS:
                 )
             node.is_expanded = True
     
-    def _terminal_value(self, node: MCTSNode, ply_from_root: int) -> float:
+    def _terminal_value(self, node: MCTSNode) -> float:
         """Return game outcome from current player's perspective."""
         outcome = node.board.outcome()
-
-        print("terminal node reached!")
-
         if outcome is None or outcome.winner is None:
             return 0.0
-
-        MATE_BASE = 100000.0
-
-        # In a checkmated position, board.turn is the loser.
-        if outcome.winner != node.board.turn:
-            return -MATE_BASE + ply_from_root
-        else:
-            return MATE_BASE - ply_from_root
+        return 10_000 - node.distance if outcome.winner != node.board.turn else -10_000 + node.distance
     
     def _backprop(self, path: list[MCTSNode], value: float) -> None:
         """Update visit counts and value sums along path."""
@@ -274,18 +281,6 @@ class MCTS:
     def best_move(self, board: chess.Board, add_noise: bool = False) -> chess.Move:
         """Run MCTS and return the best move."""
         root = self.run(board, add_noise=add_noise)
-
-        MATE_THRESHOLD = 99900.0
-
-        winning_children = [
-            (move, child.q_value)
-            for move, child in root.children.items()
-            if child.visit_count > 0 and child.q_value > MATE_THRESHOLD
-        ]
-
-        if winning_children:
-            return max(winning_children, key=lambda x: x[1])[0]
-
         moves, probs = self.get_policy(root)
         return moves[int(probs.argmax())]
 
@@ -298,15 +293,25 @@ if __name__ == "__main__":
     
     net = ChessNet(num_res_blocks=4, channels=128).to(device)
     
+    # Compare serial vs parallel
+    print("\n=== Serial MCTS (from mcts_simple.py) ===")
+    from mcts_simple import MCTS
+    mcts_serial = MCTS(net, device, num_sims=800)
+    
     board = chess.Board()
+    start = time.time()
+    root_serial = mcts_serial.run(board)
+    serial_time = time.time() - start
+    print(f"Time: {serial_time:.2f}s ({800/serial_time:.1f} sims/sec)")
     
     print("\n=== Parallel MCTS (batched) ===")
-    mcts_parallel = MCTS(net, device, num_sims=800, batch_size=16)
+    mcts_parallel = ParallelMCTS(net, device, num_sims=800, batch_size=16)
     
     start = time.time()
     root_parallel = mcts_parallel.run(board)
     parallel_time = time.time() - start
     print(f"Time: {parallel_time:.2f}s ({800/parallel_time:.1f} sims/sec)")
+    print(f"Speedup: {serial_time/parallel_time:.1f}x")
     
     # Show top moves from parallel version
     moves, probs = mcts_parallel.get_policy(root_parallel)

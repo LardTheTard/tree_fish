@@ -8,13 +8,12 @@ from network import ChessNet
 from mcts import MCTS
 from play import *
 # C:\Users\ZhaoLo\chess\backend\venv\Scripts\activate.bat
-# python main.py dataset_trained_40iter.pt --color white --sims 500
-# python main.py dataset_trained_140iter.pt --color white --sims 500
-# python main.py dataset_trained_160iter.pt --color white --sims 500
-# python main.py fast_loss_decrease_100iter.pt --color white --sims 500
 
-# NN can't find mate in one, probably no mate flag or all mates look the same to it.
-# Fix this by making a mate flag???
+# 500 sims for fast, weak play
+# 1600 sims for normal, stronger play
+
+# python main.py dataset_trained_40iter.pt --color white --sims 1600
+# python main.py dataset_trained_140iter.pt --color white --sims 500
 
 # ------------ ENGINE LOGIC --------------
 
@@ -114,6 +113,7 @@ if __name__ == "__main__":
         network=net,
         device=device,
         num_sims=args.sims,
+        batch_size=32,
         temperature=0.0,         # deterministic best move
     )
 
