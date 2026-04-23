@@ -53,6 +53,16 @@ function App() {
 
         gameAfterResponse.move(response);
         setGame(gameAfterResponse);
+
+        if (gameAfterResponse.isCheckmate()) {
+          setGameStatus(
+            gameAfterResponse.turn() === "w"
+              ? "Black wins by checkmate!"
+              : "White wins by checkmate!"
+          );
+        } else if (gameAfterResponse.isDraw()) {
+          setGameStatus("Game drawn.");
+        }
       }
 
       return true;
