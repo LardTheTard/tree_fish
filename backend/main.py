@@ -14,6 +14,7 @@ from play import *
 
 # python main.py dataset_trained_40iter.pt --color white --sims 1600
 # python main.py dataset_trained_140iter.pt --color white --sims 500
+# python main.py dataset_trained_2000iter.pt --color white --sims 500
 
 # ------------ ENGINE LOGIC --------------
 

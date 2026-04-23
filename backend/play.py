@@ -87,6 +87,9 @@ def ai_move(
             key=lambda x: -x[1]
         )[:3]
         print("\r" + " " * 30 + "\r", end="")  # clear "thinking..." line
+
+        # print("root q value", root.q_value)
+
         for m, p, visits in top_k:
             q = root.children[m].q_value
             print(f"  {board.san(m):8s}  visits={visits:4d}  prob={p:.3f}  Q={q:+.3f}")

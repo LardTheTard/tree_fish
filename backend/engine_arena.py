@@ -7,10 +7,10 @@ from mcts import MCTS
 
 from tqdm import tqdm
 
-CHECKPOINT1 = r'C:\Users\login\tree_fish\tree_fish\backend\dataset_trained_140iter.pt'
-CHECKPOINT2 = r'C:\Users\login\tree_fish\tree_fish\backend\dataset_trained_140iter.pt'
-NUM_SIMS = 500
-NUM_SIMS_2 = 0
+CHECKPOINT1 = r'C:\Users\ZhaoLo\chess\backend\dataset_trained_40iter.pt'
+CHECKPOINT2 = r'C:\Users\ZhaoLo\chess\backend\checkpoint_iter2000.pt'
+NUM_SIMS = 100
+NUM_SIMS_2 = 100
 SHOW_THINKING = False
 NUM_GAMES = 10
 
@@ -82,7 +82,7 @@ def load_checkpoint(path: str):
             weight_decay: float = 1e-4
             num_iterations: int = 50
             device: str = "cuda"
-            seed: int = random.random(1, 2**32)
+            seed: int = 72
             checkpoint_every: int = 5
             use_compile: bool = False
         

@@ -229,7 +229,10 @@ class MCTS:
         """Return game outcome from current player's perspective."""
         outcome = node.board.outcome()
 
-        print("terminal node reached!")
+        # print(f"terminal node reached {ply_from_root} deep")
+        # print(outcome.winner)
+        # print(node.board.turn)
+        # print(node.board)
 
         if outcome is None or outcome.winner is None:
             return 0.0
@@ -238,9 +241,9 @@ class MCTS:
 
         # In a checkmated position, board.turn is the loser.
         if outcome.winner != node.board.turn:
-            return -MATE_BASE + ply_from_root
-        else:
             return MATE_BASE - ply_from_root
+        else:
+            return -MATE_BASE + ply_from_root
     
     def _backprop(self, path: list[MCTSNode], value: float) -> None:
         """Update visit counts and value sums along path."""
@@ -274,17 +277,6 @@ class MCTS:
     def best_move(self, board: chess.Board, add_noise: bool = False) -> chess.Move:
         """Run MCTS and return the best move."""
         root = self.run(board, add_noise=add_noise)
-
-        MATE_THRESHOLD = 99900.0
-
-        winning_children = [
-            (move, child.q_value)
-            for move, child in root.children.items()
-            if child.visit_count > 0 and child.q_value > MATE_THRESHOLD
-        ]
-
-        if winning_children:
-            return max(winning_children, key=lambda x: x[1])[0]
 
         moves, probs = self.get_policy(root)
         return moves[int(probs.argmax())]
