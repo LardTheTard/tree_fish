@@ -1,7 +1,7 @@
 import msgpack
 import os
 
-directory = r'C:\Users\login\tree_fish\tree_fish\backend\data'
+directory = r'C:\Users\ZhaoLo\chess\backend\data'
 
 def load_positions(filepath):
     """Stream positions from a msgpack file."""
@@ -19,8 +19,10 @@ for filename in os.listdir(directory):
         fen = record['fen']
         moves = record['moves']
 
-        if idx == 500_000:
+        if idx % 100_000 == 0:
+            print(fen)
             print(moves)
+            print()
         
         num = max(num ,idx)
     print(num)

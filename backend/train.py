@@ -58,6 +58,7 @@ class Config:
     active_files: int = 4          # how many shard files to mix at once
     samples_per_file: int = 2500   # active_files * samples_per_file ≈ max_samples
     max_samples: int = active_files * samples_per_file
+    top_k_moves: 3
     path: str = r'C:\Users\login\tree_fish\tree_fish\backend\data'
     
     # Misc
@@ -175,6 +176,7 @@ def play_game(net: ChessNet, mcts: MCTS, device: torch.device) -> list[GameSampl
 
 def chessbench_record_to_sample(
     record: dict,
+    records_used: int,
     tau: float = 0.05,
 ) -> GameSample:
     """
@@ -222,12 +224,37 @@ def chessbench_record_to_sample(
     
     scores = torch.tensor(scores, dtype=torch.float32)
     
-    # --- 3. Softmax over moves ---
-    probs = torch.softmax(scores / tau, dim=0)
-    
-    for move, p in zip(moves, probs):
-        action = move_to_action(move)
-        policy_vec[action] = p
+    if records_used <= 3_000_000:
+        # --- 3. Softmax over moves ---
+        probs = torch.softmax(scores / tau * 2, dim=0)
+        
+        for move, p in zip(moves, probs):
+            action = move_to_action(move)
+            policy_vec[action] = p
+    elif records_used <= 10_000_000:
+        # --- keep only top-k moves ---
+        k = min(10, scores.numel())
+        topk_scores, topk_idx = torch.topk(scores, k=k, dim=0)
+
+        # --- softmax over top-k only ---
+        probs = torch.softmax(topk_scores / tau, dim=0)
+
+        for idx, p in zip(topk_idx, probs):
+            move = moves[idx]
+            action = move_to_action(move)
+            policy_vec[action] = p
+    else:
+        # --- keep only top-k moves ---
+        k = min(cfg.top_k_moves, scores.numel())
+        topk_scores, topk_idx = torch.topk(scores, k=k, dim=0)
+
+        # --- softmax over top-k only ---
+        probs = torch.softmax(topk_scores / tau, dim=0)
+
+        for idx, p in zip(topk_idx, probs):
+            move = moves[idx]
+            action = move_to_action(move)
+            policy_vec[action] = p
     
     # --- 4. Compute value target ---
     # Expected value under the distribution
@@ -562,6 +589,7 @@ def train_on_dataset():
     loss_history = []
     policy_history = []
     value_history = []
+    records_used = 0
 
     # Setup
     torch.manual_seed(cfg.seed)
@@ -647,7 +675,8 @@ def train_on_dataset():
                     refill_stream(i)
                     continue
 
-                sample = chessbench_record_to_sample(record)
+                sample = chessbench_record_to_sample(record, records_used)
+                records_used += 1
                 if sample is None:
                     continue
 

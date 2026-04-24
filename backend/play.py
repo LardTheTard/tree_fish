@@ -85,7 +85,7 @@ def ai_move(
         top_k = sorted(
             zip(moves, probs, [root.children[m].visit_count for m in moves]),
             key=lambda x: -x[1]
-        )[:3]
+        )[:10]
         print("\r" + " " * 30 + "\r", end="")  # clear "thinking..." line
 
         # print("root q value", root.q_value)

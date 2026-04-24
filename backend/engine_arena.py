@@ -7,12 +7,14 @@ from mcts import MCTS
 
 from tqdm import tqdm
 
-CHECKPOINT1 = r'C:\Users\ZhaoLo\chess\backend\dataset_trained_40iter.pt'
-CHECKPOINT2 = r'C:\Users\ZhaoLo\chess\backend\checkpoint_iter2000.pt'
-NUM_SIMS = 100
-NUM_SIMS_2 = 100
-SHOW_THINKING = False
-NUM_GAMES = 10
+CHECKPOINT1 = r'C:\Users\ZhaoLo\chess\backend\dataset_trained_140iter.pt'
+CHECKPOINT2 = r'C:\Users\ZhaoLo\chess\backend\dataset_trained_2900iter.pt'
+NUM_SIMS = 500
+NUM_SIMS_2 = 500
+BATCH_SIZE = 32
+SHOW_THINKING = True
+NUM_GAMES = 1
+C_PUCT = 10.0
 
 def ai_move(
     board: chess.Board,
@@ -31,11 +33,12 @@ def ai_move(
         top_k = sorted(
             zip(moves, probs, [root.children[m].visit_count for m in moves]),
             key=lambda x: -x[1]
-        )[:3]
+        )[:1]
         print("\r" + " " * 30 + "\r", end="")  # clear "thinking..." line
         for m, p, visits in top_k:
             q = root.children[m].q_value
             print(f"  {board.san(m):8s}  visits={visits:4d}  prob={p:.3f}  Q={q:+.3f}")
+        print(board.fen())
     
     best_move = moves[int(probs.argmax())]
     return best_move
@@ -132,6 +135,8 @@ def main():
         network=net,
         device=device,
         num_sims=NUM_SIMS,
+        batch_size=BATCH_SIZE,
+        c_puct=C_PUCT,
         temperature=0.0,         # deterministic best move
     )
 
@@ -151,6 +156,8 @@ def main():
         network=net_2,
         device=device,
         num_sims=NUM_SIMS_2,
+        batch_size=BATCH_SIZE,
+        c_puct=C_PUCT,
         temperature=0.0,         # deterministic best move
     )
     

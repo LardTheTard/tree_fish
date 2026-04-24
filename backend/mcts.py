@@ -20,6 +20,16 @@ from typing import Optional
 from board_encoder import board_to_tensor, legal_moves_mask, move_to_action, NUM_ACTIONS
 from network import ChessNet
 
+MATE_BASE = 1.0
+"""
+(1.0) Pushes the bot towards efficient mates, 
+high values make it go for mate threats that might not work.
+"""
+
+DRAW_VALUE = -5.0 
+"""
+(0.0) Discourages/encourages the bot drawing.
+"""
 
 class MCTSNode:
     """A node in the search tree."""
@@ -53,9 +63,9 @@ class MCTSNode:
         """PUCT formula: Q(s,a) + U(s,a)"""
         total_visits = self.visit_count + self.virtual_loss
 
-        # (heuristic)
-        if self.q_value > 0.8:
-            c_puct /= 4
+        # # (heuristic)
+        # if self.q_value > 0.8:
+        #     c_puct /= 4
             
         u = c_puct * self.prior * math.sqrt(parent_visits) / (1 + total_visits)
         return self.q_value + u
@@ -82,7 +92,7 @@ class MCTS:
         device: torch.device,
         num_sims: int = 800,
         batch_size: int = 16,
-        c_puct: float = 2,
+        c_puct: float = 2.5,
         virtual_loss_weight: float = 1.0,
         dirichlet_alpha: float = 0.3,
         temperature: float = 1.0,
@@ -243,15 +253,13 @@ class MCTS:
         # print(node.board)
 
         if outcome is None or outcome.winner is None:
-            return 0.0
-
-        MATE_BASE = 100000.0
+            return DRAW_VALUE
 
         # In a checkmated position, board.turn is the loser.
         if outcome.winner != node.board.turn:
-            return MATE_BASE - ply_from_root
+            return max(MATE_BASE - ply_from_root, 1.0)
         else:
-            return -MATE_BASE + ply_from_root
+            return min(-MATE_BASE + ply_from_root, -1.0)
     
     def _backprop(self, path: list[MCTSNode], value: float) -> None:
         """Update visit counts and value sums along path."""

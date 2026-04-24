@@ -9,14 +9,21 @@ from mcts import MCTS
 from play import *
 # C:\Users\ZhaoLo\chess\backend\venv\Scripts\activate.bat
 
-# 500 sims for fast, weak play
+# 500 sims for fast, weaker play
 # 1600 sims for normal, stronger play
 
 # python main.py dataset_trained_40iter.pt --color white --sims 1600
 # python main.py dataset_trained_140iter.pt --color white --sims 500
-# python main.py dataset_trained_2000iter.pt --color white --sims 1000
+# python main.py dataset_trained_2000iter.pt --color white --sims 300
+# python main.py dataset_trained_2900iter.pt --color white --sims 500
 
 # ------------ ENGINE LOGIC --------------
+
+C_PUCT = 10.0
+"""
+(2.5) This solves the "shuffling problem" by making it actually search instead of 
+relying too hard on its undertrained policy/value network 
+"""
 
 PROMOTION_MAP = {
     "q": chess.QUEEN,
@@ -115,6 +122,7 @@ if __name__ == "__main__":
         device=device,
         num_sims=args.sims,
         batch_size=32,
+        c_puct=C_PUCT,
         temperature=0.0,         # deterministic best move
     )
 
