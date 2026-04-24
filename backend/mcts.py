@@ -233,9 +233,9 @@ class MCTS:
                 child_board.push(move)
                 prior = float(node_probs[move_to_action(move)])
 
-                # -------- (heuristic) Slight bias towards checks and captures in order to promote attacking behaviours when winning/explore them more
-                if node.board.is_capture(move) or child_board.is_check():
-                    prior *= 1.2
+                # # -------- (heuristic) Slight bias towards checks and captures in order to promote attacking behaviours when winning/explore them more
+                # if node.board.is_capture(move) or child_board.is_check():
+                #     prior *= 1.2
 
                 node.children[move] = MCTSNode(
                     board=child_board,

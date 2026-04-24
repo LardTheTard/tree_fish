@@ -7,14 +7,14 @@ from mcts import MCTS
 
 from tqdm import tqdm
 
-CHECKPOINT1 = r'C:\Users\ZhaoLo\chess\backend\dataset_trained_140iter.pt'
-CHECKPOINT2 = r'C:\Users\ZhaoLo\chess\backend\dataset_trained_2900iter.pt'
-NUM_SIMS = 500
-NUM_SIMS_2 = 500
-BATCH_SIZE = 32
+CHECKPOINT1 = r'C:\Users\ZhaoLo\chess\backend\dataset_trained_2900iter.pt'
+CHECKPOINT2 = r'C:\Users\ZhaoLo\chess\backend\dataset_trained_140iter.pt'
+NUM_SIMS = 1000
+NUM_SIMS_2 = 1000
+BATCH_SIZE = 64
 SHOW_THINKING = True
 NUM_GAMES = 1
-C_PUCT = 10.0
+C_PUCT = 6.0
 
 def ai_move(
     board: chess.Board,
@@ -33,7 +33,7 @@ def ai_move(
         top_k = sorted(
             zip(moves, probs, [root.children[m].visit_count for m in moves]),
             key=lambda x: -x[1]
-        )[:1]
+        )[:10]
         print("\r" + " " * 30 + "\r", end="")  # clear "thinking..." line
         for m, p, visits in top_k:
             q = root.children[m].q_value
@@ -182,6 +182,8 @@ def main():
             else:
                 move = ai_move(board, mcts_2, show_thinking=SHOW_THINKING)
                 board.push(move)
+            
+            print(board.unicode(invert_color=True))
 
 
         # Game over
