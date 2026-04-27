@@ -38,7 +38,7 @@ import matplotlib.pyplot as plt
 @dataclass
 class Config:
     # Network
-    num_res_blocks: int = 8
+    num_res_blocks: int = 10
     channels: int = 256
 
     # Training
@@ -46,8 +46,8 @@ class Config:
     batch_size: int = 100
     train_steps: int = 100
     lr: float = 1e-3
-    num_iterations: int = 500
-    checkpoint_every: int = 50
+    num_iterations: int = 4000
+    checkpoint_every: int = 200
 
     # Self-play
     games_per_iter: int = 10
@@ -58,7 +58,7 @@ class Config:
     active_files: int = 4          # how many shard files to mix at once
     samples_per_file: int = 2500   # active_files * samples_per_file ≈ max_samples
     max_samples: int = active_files * samples_per_file
-    top_k_moves: 3
+    top_k_moves: int = 3
     path: str = r'C:\Users\login\tree_fish\tree_fish\backend\data'
     
     # Misc
@@ -224,20 +224,20 @@ def chessbench_record_to_sample(
     
     scores = torch.tensor(scores, dtype=torch.float32)
     
-    if records_used <= 3_000_000:
+    if records_used <= 1_000_000:
         # --- 3. Softmax over moves ---
         probs = torch.softmax(scores / tau * 2, dim=0)
         
         for move, p in zip(moves, probs):
             action = move_to_action(move)
             policy_vec[action] = p
-    elif records_used <= 10_000_000:
+    elif records_used <= 5_000_000:
         # --- keep only top-k moves ---
         k = min(10, scores.numel())
-        topk_scores, topk_idx = torch.topk(scores, k=k, dim=0)
+        scores, topk_idx = torch.topk(scores, k=k, dim=0)
 
         # --- softmax over top-k only ---
-        probs = torch.softmax(topk_scores / tau, dim=0)
+        probs = torch.softmax(scores / tau, dim=0)
 
         for idx, p in zip(topk_idx, probs):
             move = moves[idx]
@@ -246,10 +246,10 @@ def chessbench_record_to_sample(
     else:
         # --- keep only top-k moves ---
         k = min(cfg.top_k_moves, scores.numel())
-        topk_scores, topk_idx = torch.topk(scores, k=k, dim=0)
+        scores, topk_idx = torch.topk(scores, k=k, dim=0)
 
         # --- softmax over top-k only ---
-        probs = torch.softmax(topk_scores / tau, dim=0)
+        probs = torch.softmax(scores / (tau / 2), dim=0)
 
         for idx, p in zip(topk_idx, probs):
             move = moves[idx]
@@ -623,6 +623,7 @@ def train_on_dataset():
     # State for each active file stream
     stream_states = []
     next_file_idx = 0
+    records_used = 0
 
     def open_new_stream():
         nonlocal next_file_idx
@@ -655,6 +656,7 @@ def train_on_dataset():
         stream_states[i] = open_new_stream()
 
     def get_mixed_samples(total_n: int) -> list[GameSample]:
+        nonlocal records_used
         samples = []
 
         if len(stream_states) == 0:

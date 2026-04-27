@@ -23,13 +23,10 @@ from network import ChessNet
 from mcts import MCTS
 
 
-def display_board(board: chess.Board, flip: bool = False):
+def display_board(board: chess.Board):
     """Print the board with coordinates."""
     print()
-    if flip:
-        print("  " + board.unicode(borders=True, invert_color=True))
-    else:
-        print("  " + board.unicode(borders=True))
+    print("  " + board.unicode(borders=True))
     print()
 
 
@@ -85,7 +82,8 @@ def ai_move(
         top_k = sorted(
             zip(moves, probs, [root.children[m].visit_count for m in moves]),
             key=lambda x: -x[1]
-        )[:10]
+        )
+        # )[:10]
         print("\r" + " " * 30 + "\r", end="")  # clear "thinking..." line
 
         # print("root q value", root.q_value)
@@ -172,6 +170,8 @@ def load_checkpoint(path: str):
 
 
 def main():
+    # python play.py dataset_trained_4000iter.pt --sims 500
+
     parser = argparse.ArgumentParser(description="Play against trained chess AI")
     parser.add_argument("checkpoint", help="Path to checkpoint .pt file")
     parser.add_argument("--color", choices=["white", "black"], default="white",
@@ -201,12 +201,13 @@ def main():
         network=net,
         device=device,
         num_sims=args.sims,
-        num_parallel=args.sims,  # 1 GPU call per move
+        batch_size=32,  # 1 GPU call per move
         temperature=0.0,         # deterministic best move
     )
 
     user_is_white = (args.color == "white")
     board = chess.Board()
+    board.set_fen('3k4/8/8/8/8/8/3p4/K7 b - - 0 1')
 
     print("=" * 60)
     print(f"  You are playing as {args.color.upper()}")
@@ -214,7 +215,7 @@ def main():
     print("=" * 60)
     print("\nCommands: type move in SAN (e.g. 'e4'), 'undo', 'help', or 'quit'\n")
 
-    display_board(board, flip=not user_is_white)
+    display_board(board)
 
     move_history = []
 
@@ -228,7 +229,7 @@ def main():
                 print("\nGame aborted.")
                 break
             if move == "undo":
-                display_board(board, flip=not user_is_white)
+                display_board(board)
                 continue
             
             san = board.san(move)
@@ -244,7 +245,7 @@ def main():
             move_history.append(san)
             print(f"AI played:  {san}\n")
         
-        display_board(board, flip=not user_is_white)
+        display_board(board)
 
     # Game over
     outcome = board.outcome()

@@ -101,7 +101,7 @@ _KNIGHT_DELTAS = [
     (2, 1), (2, -1), (-2, 1), (-2, -1),
     (1, 2), (1, -2), (-1, 2), (-1, -2),
 ]
-_UNDER_PROMO_PIECES = [chess.ROOK, chess.BISHOP, chess.KNIGHT]  # not queen (queen is default)
+PROMO_PIECES = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]  # not queen (queen is default)
 _PROMO_DIRS = [(-1, 1), (0, 1), (1, 1)]  # left-diag, straight, right-diag (from White's POV)
 
 
@@ -184,3 +184,10 @@ def action_to_move(action_idx: int, board: chess.Board) -> chess.Move | None:
         if move_to_action(move) == action_idx:
             return move
     return None
+
+def main():
+    for entry in _MOVE_TO_IDX:
+        if entry[2] == 
+
+if __name__ == '__main__':
+    main()

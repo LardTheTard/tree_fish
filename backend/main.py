@@ -12,14 +12,15 @@ from play import *
 # 500 sims for fast, weaker play
 # 1600 sims for normal, stronger play
 
-# python main.py dataset_trained_40iter.pt --color white --sims 1600
-# python main.py dataset_trained_140iter.pt --color white --sims 500
+# python main.py dataset_trained_40iter.pt --color white --sims 500
+# python main.py dataset_trained_140iter.pt --color white --sims 1600
 # python main.py dataset_trained_2000iter.pt --color white --sims 300
-# python main.py dataset_trained_2900iter.pt --color white --sims 500
+# python main.py dataset_trained_2900iter.pt --color white --sims 1600
+# python main.py dataset_trained_4000iter.pt --color white --sims 1600
 
 # ------------ ENGINE LOGIC --------------
 
-C_PUCT = 10.0
+C_PUCT = 6.0
 """
 (2.5) This solves the "shuffling problem" by making it actually search instead of 
 relying too hard on its undertrained policy/value network 

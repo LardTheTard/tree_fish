@@ -1,7 +1,7 @@
 import msgpack
 import os
 
-directory = r'C:\Users\ZhaoLo\chess\backend\data'
+directory = r'C:\Users\login\tree_fish\tree_fish\backend\data'
 
 def load_positions(filepath):
     """Stream positions from a msgpack file."""
